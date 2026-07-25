@@ -1,164 +1,392 @@
 
+// Banco local de respaldo, usado solo si no se puede descargar la lista remota.
+// Cubre longitudes cortas, medias y largas para que los tres niveles de
+// dificultad se sigan sintiendo distintos aunque no haya conexión.
 const FALLBACK_WORDS_ES = [
-    "gato", "mesa", "libro", "casa", "perro", "luna", "sol", "agua", "fuego", "tierra",
-    "mundo", "tiempo", "vida", "mano", "noche", "dia", "hombre", "mujer", "ola", "puerta",
-    "camino", "piedra", "rio", "bosque", "campo", "pluma", "reloj", "cuerpo", "mente", "calle",
-    "barco", "juego", "flor", "viento", "lago", "monte", "playa", "hierba", "nube", "roca",
-    "silla", "techo", "piso", "carro", "muro", "humo", "pasto", "sombra", "forma", "grupo"
+    // cortas (2-5)
+    "gato", "mesa", "casa", "luna", "sol", "agua", "vida", "mano", "dia", "ola",
+    "libro", "perro", "fuego", "mundo", "noche", "campo", "pluma", "reloj", "calle", "barco",
+    "juego", "flor", "lago", "monte", "playa", "nube", "roca", "silla", "techo", "piso",
+    "carro", "muro", "humo", "pasto", "forma", "grupo", "rio", "cielo", "papel", "clave",
+    // medias (6-8)
+    "tiempo", "hombre", "puerta", "camino", "piedra", "bosque", "cuerpo", "viento", "sombra",
+    "ventana", "montana", "palabra", "escuela", "familia", "trabajo", "musica", "silencio",
+    "caminos", "sonido", "arbol", "puente", "jardin", "cocina", "manana", "semana",
+    // largas (9-14)
+    "biblioteca", "computadora", "aventura", "carretera", "escritorio", "movimiento",
+    "naturaleza", "personaje", "resultado", "telefono", "universo", "velocidad",
+    "conocimiento", "herramienta", "importante", "literatura", "matematicas", "organizacion",
+    "pensamiento", "responsable", "tecnologia", "territorio", "transporte", "vocabulario"
 ];
 
 const FALLBACK_WORDS_EN = [
+    // cortas (2-5)
     "house", "water", "light", "world", "stone", "dream", "river", "cloud", "flame", "music",
     "plant", "chair", "table", "green", "storm", "brain", "clock", "dance", "earth", "glass",
     "heart", "knife", "lemon", "night", "ocean", "piano", "queen", "robot", "snake", "tower",
     "bread", "candy", "tiger", "whale", "field", "grain", "horse", "judge", "maple", "novel",
-    "pearl", "quilt", "train", "voice", "witch", "bloom", "crest", "drift", "frost", "globe"
+    // medias (6-8)
+    "garden", "silver", "winter", "market", "bridge", "forest", "island", "letter", "mirror",
+    "orange", "planet", "rocket", "shadow", "silence", "morning", "picture", "kitchen",
+    "machine", "journey", "history", "science", "teacher", "weather", "freedom",
+    // largas (9-14)
+    "adventure", "background", "collection", "difference", "electricity", "environment",
+    "generation", "importance", "information", "keyboard", "landscape", "mountain",
+    "understand", "technology", "restaurant", "possibility", "responsible", "temperature",
+    "university", "vocabulary", "wonderful", "connection", "development", "experience"
 ];
 
 /**
- * Construye oraciones de 5 palabras a partir del banco de palabras de fallback.
+ * Construye oraciones a partir del banco de palabras local de respaldo.
+ * Se usa cuando la lista remota no se puede descargar.
  * @param {string} language - 'es' o 'en'
  * @param {string} difficulty - 'easy', 'medium', 'hard'
- * @returns {string[]} Array de oraciones (strings de 5 palabras)
+ * @returns {string[]} Array de oraciones
  */
 function buildFallbackSentences(language = 'es', difficulty = 'medium') {
-    const wordsPool = language === 'en' ? [...FALLBACK_WORDS_EN] : [...FALLBACK_WORDS_ES];
-    const wordsPerSentence = 5;
-    const sentenceCount = difficulty === 'easy' ? 3 : difficulty === 'hard' ? 6 : 5;
+    const pool = language === 'en' ? FALLBACK_WORDS_EN : FALLBACK_WORDS_ES;
+    const profile = DIFFICULTY_PROFILES[difficulty] || DIFFICULTY_PROFILES.medium;
+    const total = WORDS_PER_SENTENCE * profile.sentenceCount;
 
-    // Mezclar palabras aleatoriamente
-    for (let i = wordsPool.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [wordsPool[i], wordsPool[j]] = [wordsPool[j], wordsPool[i]];
+    return buildSentences(pickWords(pool, profile, total));
+}
+
+// ============================================================
+// FUENTE DE PALABRAS
+// ------------------------------------------------------------
+// Cadena de tres niveles, de más a menos preferido. Si un nivel falla se pasa
+// al siguiente, así que el juego nunca se queda sin palabras:
+//
+//   1. API de Datamuse (servicio externo). REST, sin API key, con CORS.
+//      Se consulta por patrón de longitud y por vocabulario de idioma, de modo
+//      que el idioma lo decide el servidor y no una heurística nuestra.
+//   2. Listas de idioma de Monkeytype vía CDN de jsDelivr. Corpus curados,
+//      ordenados por frecuencia, un archivo por idioma.
+//   3. Banco local de respaldo incluido en este archivo.
+//
+// El punto clave frente a la implementación anterior: nunca se intenta
+// "adivinar" el idioma de una palabra con expresiones regulares. Se pide el
+// idioma correcto y se usa lo que devuelve, así que no hay mezcla entre
+// español e inglés, ni palabras inventadas, ni nombres propios.
+// ============================================================
+
+// --- Nivel 1: API de Datamuse ---
+// Docs: https://www.datamuse.com/api/  ·  100k peticiones/día sin registro.
+// Parámetros usados:
+//   sp   patrón de escritura ('?' = exactamente un carácter cualquiera)
+//   v    vocabulario de idioma ('es' = español; sin este parámetro, inglés)
+//   max  máximo de resultados (tope del servicio: 1000)
+//   md=f pide la frecuencia de uso de cada palabra, como tag "f:<n>"
+//        (apariciones por millón). Es lo que permite descartar rarezas.
+const WORD_API_URL = 'https://api.datamuse.com/words';
+const WORD_API_MAX = 1000;
+
+// Cuántas consultas se lanzan en paralelo por partida. Cada una lleva su
+// propia letra inicial y su propia longitud, de ahí sale la variedad.
+const WORD_API_QUERIES = 4;
+
+// Umbral de frecuencia (apariciones por millón). Por debajo de esto aparecen
+// conjugaciones raras y tecnicismos ("rectoscopios", "antevert") que no
+// sirven para un juego de mecanografía.
+const MIN_WORD_FREQUENCY = 1.0;
+
+// Tras ordenar por frecuencia, solo se conserva esta cabecera de cada consulta.
+// Es el ajuste que más influye en la calidad: el umbral por sí solo no basta,
+// porque la cola de resultados (aun cumpliéndolo) trae abreviaturas y
+// fragmentos como "acc", "anc" o "puf". Quedarse con las más frecuentes es lo
+// que hace utilizables a los corpus tipo "las 1000 más usadas".
+const WORD_API_TOP_N = 150;
+
+// IMPORTANTE: hay que anclar la letra inicial. Una consulta abierta como
+// 'sp=?????*' agota el tope de 1000 resultados dentro de una sola letra
+// (se comprobó: las 1000 respuestas empezaban por "r"), así que todas las
+// partidas saldrían con palabras de la misma letra. Consultando por letra
+// se recorre el alfabeto de verdad.
+// Se omiten las iniciales sin apenas palabras comunes en cada idioma.
+const WORD_API_LETTERS = {
+    es: 'abcdefghijlmnopqrstuv',
+    en: 'abcdefghilmnoprstuvw'
+};
+
+// --- Nivel 2: listas curadas ---
+const WORDLIST_BASE_URL =
+    'https://cdn.jsdelivr.net/gh/monkeytypegame/monkeytype@master/frontend/static/languages';
+
+// Archivo de lista por idioma y tamaño de corpus
+const WORDLIST_FILES = {
+    es: { common: 'spanish_1k', extended: 'spanish_10k' },
+    en: { common: 'english_1k', extended: 'english_10k' }
+};
+
+// Perfil de cada dificultad: qué corpus usar, rango de longitud y nº de oraciones
+const DIFFICULTY_PROFILES = {
+    easy: { corpus: 'common', minLength: 2, maxLength: 5, sentenceCount: 3 },
+    medium: { corpus: 'common', minLength: 4, maxLength: 8, sentenceCount: 5 },
+    hard: { corpus: 'extended', minLength: 7, maxLength: 14, sentenceCount: 6 }
+};
+
+const WORDS_PER_SENTENCE = 5;
+
+// Corta la petición si el servicio no responde, para no dejar el menú colgado
+const WORDLIST_TIMEOUT_MS = 8000;
+
+// Añade un punto final a cada oración. Es lo que activa el bonus de oración
+// completada (SENTENCE_BONUS); ponlo en false si no quieres teclear el punto.
+const ADD_SENTENCE_PERIODS = true;
+
+// Solo minúsculas simples: sin tildes, para no exigir teclado configurado.
+// La ñ sí se acepta en español porque es una tecla propia del layout.
+const WORD_PATTERN = { es: /^[a-zñ]+$/, en: /^[a-z]+$/ };
+
+// Las palabras descargadas se reutilizan entre partidas, con la URL como clave
+const wordListCache = new Map();
+
+/**
+ * GET de JSON con timeout. AbortController evita que una petición colgada
+ * bloquee indefinidamente el inicio de la partida.
+ * @param {string} url
+ * @returns {Promise<any>} El JSON ya parseado
+ */
+async function fetchJson(url) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), WORDLIST_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) {
+            throw new Error(`respondió con status ${response.status}`);
+        }
+        return await response.json();
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+/** Entero aleatorio en [min, max], ambos incluidos. */
+function randomInt(min, max) {
+    return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+/** Lee la frecuencia de uso (tag "f:<n>") de una entrada de Datamuse. */
+function entryFrequency(entry) {
+    const tags = (entry && entry.tags) || [];
+    for (const tag of tags) {
+        if (typeof tag === 'string' && tag.startsWith('f:')) {
+            const value = parseFloat(tag.slice(2));
+            if (!Number.isNaN(value)) return value;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Una consulta a Datamuse: palabras de longitud `length` que empiezan por
+ * `letter`, filtradas por idioma y por frecuencia mínima de uso.
+ * @returns {Promise<string[]>}
+ */
+async function fetchApiWordsFor(language, letter, length) {
+    const params = new URLSearchParams({
+        sp: letter + '?'.repeat(length - 1),
+        max: String(WORD_API_MAX),
+        md: 'f'
+    });
+    // Sin el parámetro `v`, Datamuse responde en inglés
+    if (language === 'es') params.set('v', 'es');
+
+    const url = `${WORD_API_URL}?${params}`;
+    if (wordListCache.has(url)) {
+        return wordListCache.get(url);
     }
 
+    const data = await fetchJson(url);
+    if (!Array.isArray(data)) {
+        throw new Error('formato inesperado: se esperaba un array');
+    }
+
+    const pattern = WORD_PATTERN[language] || WORD_PATTERN.es;
+    const words = data
+        .map(entry => ({
+            word: (entry && typeof entry.word === 'string') ? entry.word.trim() : '',
+            frequency: entryFrequency(entry)
+        }))
+        .filter(item => item.frequency >= MIN_WORD_FREQUENCY && pattern.test(item.word))
+        // De más a menos usada, y nos quedamos solo con la cabecera
+        .sort((a, b) => b.frequency - a.frequency)
+        .slice(0, WORD_API_TOP_N)
+        .map(item => item.word);
+
+    wordListCache.set(url, words);
+    return words;
+}
+
+/**
+ * Nivel 1 — Reúne el vocabulario de la partida desde la API de Datamuse.
+ *
+ * Lanza varias consultas en paralelo, cada una con una letra inicial y una
+ * longitud distintas dentro del rango de la dificultad. Que fallen algunas no
+ * importa mientras el conjunto reúna palabras suficientes.
+ *
+ * @param {string} language - 'es' o 'en'
+ * @param {{minLength: number, maxLength: number}} profile - Perfil de dificultad
+ * @returns {Promise<string[]>} Palabras válidas, sin duplicados
+ */
+async function fetchWordsFromApi(language, profile) {
+    const alphabet = WORD_API_LETTERS[language] || WORD_API_LETTERS.es;
+
+    // Letras distintas entre sí, para no repetir la misma consulta
+    const letters = [...alphabet].sort(() => Math.random() - 0.5).slice(0, WORD_API_QUERIES);
+
+    const results = await Promise.allSettled(letters.map(letter =>
+        fetchApiWordsFor(language, letter, randomInt(profile.minLength, profile.maxLength))
+    ));
+
+    const words = [...new Set(
+        results.filter(r => r.status === 'fulfilled').flatMap(r => r.value)
+    )];
+
+    if (words.length < WORDS_PER_SENTENCE) {
+        const failed = results.filter(r => r.status === 'rejected').length;
+        throw new Error(
+            `solo ${words.length} palabras utilizables (${failed}/${results.length} consultas fallidas)`
+        );
+    }
+
+    return words;
+}
+
+/**
+ * Nivel 2 — Descarga una lista curada de idioma desde el CDN.
+ * @param {string} language - 'es' o 'en'
+ * @param {string} corpus - 'common' o 'extended'
+ * @returns {Promise<string[]>} Palabras válidas, sin duplicados
+ */
+async function fetchWordList(language, corpus) {
+    const fileName = (WORDLIST_FILES[language] || WORDLIST_FILES.es)[corpus];
+    const url = `${WORDLIST_BASE_URL}/${fileName}.json`;
+
+    if (wordListCache.has(url)) {
+        return wordListCache.get(url);
+    }
+
+    const data = await fetchJson(url);
+    if (!data || !Array.isArray(data.words)) {
+        throw new Error('formato de lista inválido: falta el array "words"');
+    }
+
+    // El patrón se aplica ANTES de bajar a minúsculas: así los nombres
+    // propios del corpus (Madrid, Carlos, January, Texas...) quedan fuera
+    // en lugar de colarse convertidos en "madrid" o "january".
+    const pattern = WORD_PATTERN[language] || WORD_PATTERN.es;
+    const words = [...new Set(
+        data.words
+            .map(word => String(word).trim())
+            .filter(word => pattern.test(word))
+    )];
+
+    if (words.length < WORDS_PER_SENTENCE) {
+        throw new Error(`solo ${words.length} palabras utilizables en ${fileName}`);
+    }
+
+    wordListCache.set(url, words);
+    return words;
+}
+
+/**
+ * Elige palabras al azar respetando el rango de longitud de la dificultad.
+ * Si no hay suficientes en ese rango, lo ensancha progresivamente en vez de
+ * fallar, de modo que siempre se devuelva una partida completa.
+ * @param {string[]} pool - Palabras disponibles
+ * @param {{minLength: number, maxLength: number}} profile - Perfil de dificultad
+ * @param {number} count - Cuántas palabras se necesitan
+ * @returns {string[]}
+ */
+function pickWords(pool, profile, count) {
+    let { minLength, maxLength } = profile;
+    let candidates = pool.filter(w => w.length >= minLength && w.length <= maxLength);
+
+    // Ensanchar el rango hasta reunir suficientes palabras distintas
+    while (candidates.length < count && (minLength > 1 || maxLength < 30)) {
+        minLength = Math.max(1, minLength - 1);
+        maxLength = Math.min(30, maxLength + 1);
+        candidates = pool.filter(w => w.length >= minLength && w.length <= maxLength);
+    }
+
+    if (candidates.length === 0) candidates = [...pool];
+
+    // Fisher-Yates sobre una copia, para no mutar la lista cacheada
+    const shuffled = [...candidates];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+
+    return shuffled.slice(0, count);
+}
+
+/**
+ * Agrupa palabras en oraciones de WORDS_PER_SENTENCE palabras.
+ * @param {string[]} words
+ * @returns {string[]} Oraciones completas (se descartan los grupos incompletos)
+ */
+function buildSentences(words) {
     const sentences = [];
-    for (let i = 0; i < sentenceCount; i++) {
-        const start = i * wordsPerSentence;
-        const chunk = wordsPool.slice(start, start + wordsPerSentence);
-        if (chunk.length === wordsPerSentence) {
-            sentences.push(chunk.join(' '));
+
+    for (let i = 0; i + WORDS_PER_SENTENCE <= words.length; i += WORDS_PER_SENTENCE) {
+        const chunk = words.slice(i, i + WORDS_PER_SENTENCE);
+        if (ADD_SENTENCE_PERIODS) {
+            chunk[chunk.length - 1] += '.';
         }
+        sentences.push(chunk.join(' '));
     }
 
     return sentences;
 }
 
-// URL de la API de palabras en español
-const SENTENCES_API_URL = 'https://random-word-api.herokuapp.com/word';
-
 /**
- * Verifica si una palabra parece ser español válido para el juego.
- * Filtra palabras en inglés, con mayúsculas raras, espacios, acentos o caracteres no válidos.
- */
-function isValidSpanishWord(word) {
-    // Rechazar palabras vacías o muy cortas
-    if (!word || word.length < 2) return false;
-    // Rechazar palabras con espacios (frases compuestas)
-    if (word.includes(' ')) return false;
-    // Rechazar palabras que empiezan con mayúscula (nombres propios / inglés)
-    if (word[0] !== word[0].toLowerCase()) return false;
-    // Solo aceptar letras sin acento (a-z, ñ) — sin tildes para facilitar la escritura
-    if (!/^[a-zñ]+$/.test(word)) return false;
-    // Rechazar palabras con patrones típicos del inglés
-    if (/th|sh|wh|ck|ght|ph|ow|aw|ew|wn|wr|kn|oo|ee|tt|ll$/.test(word)) return false;
-    // Rechazar terminaciones comunes del inglés
-    if (/ing$|tion$|ness$|ment$|ful$|less$|ous$|ive$|ble$|ly$|er$|ed$|ght$|tch$/.test(word)) return false;
-    // Rechazar palabras que empiecen con combinaciones raras en español
-    if (/^(wh|th|sh|ph|kn|wr|tw|sw|sc|sk|sl|sm|sn|sp|st|str|spr)/.test(word)) return false;
-    return true;
-}
-
-/**
- * Verifica si una palabra parece ser inglés válido para el juego.
- * Filtra palabras en español, con acentos, ñ, o caracteres no ingleses.
- */
-function isValidEnglishWord(word) {
-    // Rechazar palabras vacías o muy cortas
-    if (!word || word.length < 2) return false;
-    // Rechazar palabras con espacios
-    if (word.includes(' ')) return false;
-    // Rechazar palabras que empiezan con mayúscula (nombres propios)
-    if (word[0] !== word[0].toLowerCase()) return false;
-    // Solo aceptar letras inglesas (a-z sin ñ ni acentos)
-    if (!/^[a-z]+$/.test(word)) return false;
-    // Rechazar palabras con ñ o patrones típicos del español
-    if (/ñ|ción|mente$|idad$|ismo$|ista$/.test(word)) return false;
-    return true;
-}
-
-/**
- * Carga palabras desde la API externa y las agrupa en oraciones.
- * Si la API falla, usa el fallback local.
+ * Carga las oraciones de la partida desde la lista remota del idioma elegido.
+ * Si la descarga falla, cae al banco local de respaldo.
  * @param {string} language - Idioma ('es' o 'en')
  * @param {string} difficulty - Dificultad ('easy', 'medium', 'hard')
  * @returns {Promise<string[]>} Array de oraciones
  */
 async function fetchSentences(language = 'es', difficulty = 'medium') {
-    if (!SENTENCES_API_URL) {
-        console.log('API no configurada, usando oraciones de fallback');
-        showApiFallbackNotification(language);
-        return buildFallbackSentences(language, difficulty);
-    }
+    const lang = language === 'en' ? 'en' : 'es';
+    const profile = DIFFICULTY_PROFILES[difficulty] || DIFFICULTY_PROFILES.medium;
+    const totalWords = WORDS_PER_SENTENCE * profile.sentenceCount;
 
-    // Determinar cantidad de palabras según dificultad
-    const wordsPerSentence = 5;
-    const sentenceCount = difficulty === 'easy' ? 3 : difficulty === 'hard' ? 6 : 5;
-    const totalWords = wordsPerSentence * sentenceCount;
+    // Fuentes en orden de preferencia; se usa la primera que responda bien
+    const sources = [
+        { name: 'API de Datamuse', load: () => fetchWordsFromApi(lang, profile) },
+        { name: 'listas curadas (CDN)', load: () => fetchWordList(lang, profile.corpus) }
+    ];
 
-    // Pedir más palabras de las necesarias para compensar las que se filtren
-    const requestCount = totalWords * 3;
+    for (const source of sources) {
+        try {
+            const pool = await source.load();
+            const sentences = buildSentences(pickWords(pool, profile, totalWords));
 
-    // Seleccionar idioma para la API y filtro correspondiente
-    const apiLang = language === 'en' ? 'en' : 'es';
-    const wordFilter = language === 'en' ? isValidEnglishWord : isValidSpanishWord;
-    const fallback = buildFallbackSentences(language, difficulty);
-
-    try {
-        const response = await fetch(`${SENTENCES_API_URL}?lang=${apiLang}&number=${requestCount}`);
-
-        if (!response.ok) {
-            throw new Error(`API respondió con status ${response.status}`);
-        }
-
-        const words = await response.json();
-
-        if (!Array.isArray(words) || words.length === 0) {
-            throw new Error('Formato de respuesta inválido o sin palabras');
-        }
-
-        // Filtrar: solo palabras válidas del idioma seleccionado
-        const cleanWords = words
-            .map(w => w.toLowerCase().trim())
-            .filter(wordFilter)
-            .slice(0, totalWords);
-
-        if (cleanWords.length < wordsPerSentence) {
-            throw new Error(`Solo se obtuvieron ${cleanWords.length} palabras válidas`);
-        }
-
-        // Agrupar palabras en oraciones
-        const sentences = [];
-        for (let i = 0; i < cleanWords.length; i += wordsPerSentence) {
-            const chunk = cleanWords.slice(i, i + wordsPerSentence);
-            if (chunk.length === wordsPerSentence) {
-                sentences.push(chunk.join(' '));
+            if (sentences.length === 0) {
+                throw new Error('no se pudieron formar oraciones completas');
             }
+
+            console.log(
+                `Cargadas ${sentences.length} oraciones en "${lang}" desde ${source.name} ` +
+                `(dificultad ${difficulty}, ${pool.length} palabras disponibles)`
+            );
+            return sentences;
+
+        } catch (error) {
+            const reason = error.name === 'AbortError'
+                ? `tiempo de espera agotado (${WORDLIST_TIMEOUT_MS} ms)`
+                : error.message;
+            console.warn(`Falló ${source.name}: ${reason}`);
         }
-
-        if (sentences.length === 0) {
-            throw new Error('No se pudieron formar oraciones completas');
-        }
-
-        console.log(`Cargadas ${sentences.length} oraciones en ${apiLang} desde API (${cleanWords.length} palabras)`);
-        return sentences;
-
-    } catch (error) {
-        console.warn('Error al cargar palabras desde API:', error.message);
-        console.log('Usando oraciones de fallback');
-        showApiFallbackNotification(language);
-        return fallback;
     }
+
+    // Ninguna fuente remota respondió: se juega con el banco local
+    console.log('Usando oraciones de respaldo locales');
+    showApiFallbackNotification(lang);
+    return buildFallbackSentences(lang, difficulty);
 }
 
 /**
@@ -174,11 +402,11 @@ function showApiFallbackNotification(language = 'es') {
 
     const messages = {
         es: {
-            title: 'API no disponible',
+            title: 'Lista de palabras no disponible',
             message: 'Se están usando palabras locales de respaldo. El juego funciona con normalidad.'
         },
         en: {
-            title: 'API unavailable',
+            title: 'Word list unavailable',
             message: 'Using local fallback words. The game works normally.'
         }
     };
@@ -902,6 +1130,27 @@ class CanvasEffectsRenderer {
     }
 }
 
+// --- TEXTOS DE UI DEPENDIENTES DEL IDIOMA ---
+// El hint se reescribe desde JS en cada initGame(), así que antes quedaba
+// siempre en español aunque el jugador tuviera el juego en inglés.
+// El acceso se hace con UI_TEXT[lang] || UI_TEXT.es para no romper si el
+// idioma llegara con un valor inesperado.
+const UI_TEXT = {
+    es: {
+        loading: 'Cargando palabras...',
+        startHint: 'Presiona Enter para iniciar...'
+    },
+    en: {
+        loading: 'Loading words...',
+        startHint: 'Press Enter to start...'
+    }
+};
+
+/** Devuelve los textos de UI del idioma activo, con español como respaldo. */
+function uiText() {
+    return UI_TEXT[currentLanguage] || UI_TEXT.es;
+}
+
 // --- STATE ---
 let gameActive = false;
 let gameStartTime = null;
@@ -913,12 +1162,28 @@ let animationFrameId = null;
 let animationFrameCount = 0; // Monotonic frame counter for effect throttling
 let currentDifficulty = 'medium';
 
+// True mientras initGame() espera la descarga de palabras. Bloquea startGame():
+// sin esto, pulsar Enter durante la carga arrancaba la partida con wordStates
+// vacío y animate() la daba por terminada en el primer frame.
+let isLoadingWords = false;
+
+// Token de generación de partida. Cada initGame() toma uno; al volver de la
+// descarga comprueba que sigue siendo el vigente. Así, si el jugador cambia de
+// dificultad o vuelve al menú mientras carga, la petición vieja se descarta en
+// lugar de montar una partida con la dificultad anterior.
+let initGeneration = 0;
+
 // Stats tracking
 let correctWords = 0;
 let missedWords = 0;
 let totalScore = 0;
 let completedSentences = 0;
 let accumulatedWords = []; // Words that have been typed correctly
+
+// Spans de la oración que se está escribiendo ahora mismo. Se usa para animar
+// solo esa oración al completarla: antes se hacía querySelectorAll sobre todo
+// el área acumulada y parpadeaban también las oraciones ya terminadas.
+let currentSentenceSpans = [];
 
 // Combo manager instance
 let comboManager = null;
@@ -980,6 +1245,7 @@ function cleanGameState() {
     totalScore = 0;
     completedSentences = 0;
     accumulatedWords = [];
+    currentSentenceSpans = [];
 
     // Reset combo manager
     if (comboManager) {
@@ -1002,6 +1268,10 @@ function cleanGameState() {
 
 // --- INITIALIZE GAME ---
 async function initGame() {
+    // Reclama esta partida como la vigente; cualquier initGame() anterior que
+    // siga esperando su descarga se descartará al volver.
+    const myGeneration = ++initGeneration;
+
     // CRITICAL: Clean all previous state first
     cleanGameState();
 
@@ -1062,8 +1332,22 @@ async function initGame() {
     if (menuScreen) menuScreen.style.display = 'none';
     if (gameContainer) gameContainer.style.display = '';
 
-    // Cargar oraciones desde la API (o fallback)
-    sentenceBank = await fetchSentences(currentLanguage, currentDifficulty);
+    // Cargar oraciones desde la lista remota (o el respaldo local).
+    // Mientras dura la descarga el hint avisa y startGame() queda bloqueado.
+    isLoadingWords = true;
+    startHint.textContent = uiText().loading;
+    startHint.classList.remove('hidden');
+
+    try {
+        sentenceBank = await fetchSentences(currentLanguage, currentDifficulty);
+    } finally {
+        // Solo la generación vigente libera el flag; si ya hay otra partida
+        // cargando, dejarlo en false permitiría iniciar sin palabras.
+        if (myGeneration === initGeneration) isLoadingWords = false;
+    }
+
+    // Descartar el resultado si mientras tanto se pidió otra partida
+    if (myGeneration !== initGeneration) return;
 
     // Generate sentences from bank
     const fullText = sentenceBank.join(' ');
@@ -1091,7 +1375,7 @@ async function initGame() {
     createWordElements();
 
     // Show start hint
-    startHint.textContent = 'Presiona Enter para iniciar...';
+    startHint.textContent = uiText().startHint;
     startHint.classList.remove('hidden');
 
     // Reset stats display
@@ -1141,6 +1425,12 @@ function createWordElements() {
 // --- START GAME ---
 function startGame() {
     if (gameActive) return;
+
+    // Sin palabras cargadas no hay partida que iniciar. Ocurre si el jugador
+    // pulsa Enter mientras initGame() sigue esperando la descarga: arrancar
+    // aquí dejaría animate() sin nada que animar y terminaría la partida en
+    // el primer frame, mostrando resultados en cero.
+    if (isLoadingWords || words.length === 0) return;
 
     gameActive = true;
     gameStartTime = Date.now();
@@ -1281,8 +1571,9 @@ function animate() {
     // Update live stats
     updateLiveStats();
 
-    // Check if game is complete
-    if (allWordsFinished && currentWordIndex >= words.length) {
+    // Check if game is complete. `words.length > 0` evita que una lista vacía
+    // se interprete como "partida terminada" en el primer frame.
+    if (words.length > 0 && allWordsFinished && currentWordIndex >= words.length) {
         endGame();
         return;
     }
@@ -1296,6 +1587,7 @@ function addWordToAccumulated(word) {
     const wordSpan = document.createElement('span');
     wordSpan.className = 'word-accumulated';
     wordSpan.textContent = word;
+    currentSentenceSpans.push(wordSpan);
 
     // Check if word ends with period (sentence end)
     if (word.endsWith('.')) {
@@ -1348,12 +1640,13 @@ function addWordToAccumulated(word) {
             canvasEffects.particleExplosion(ex, ey, '#f9e2af');
         }
 
-        // Animate the completed sentence
+        // Animar SOLO las palabras de esta oración, no todo el histórico
+        const sentenceSpans = currentSentenceSpans;
+        currentSentenceSpans = [];
         setTimeout(() => {
-            const allWords = accumulatedSentences.querySelectorAll('.word-accumulated');
-            allWords.forEach(w => w.classList.add('sentence-complete'));
+            sentenceSpans.forEach(w => w.classList.add('sentence-complete'));
             setTimeout(() => {
-                allWords.forEach(w => w.classList.remove('sentence-complete'));
+                sentenceSpans.forEach(w => w.classList.remove('sentence-complete'));
             }, 600);
         }, 100);
     } else {
@@ -1372,6 +1665,13 @@ function addMissedWordToAccumulated(word) {
     wordSpan.textContent = word;
     wordSpan.style.color = '#f38ba8';
     accumulatedSentences.appendChild(wordSpan);
+
+    // Si la palabra fallada era la que cerraba la oración, la oración termina
+    // igualmente (sin bonus ni animación). Hay que soltar los spans acumulados
+    // o se arrastrarían a la oración siguiente y se animarían con ella.
+    if (word.endsWith('.')) {
+        currentSentenceSpans = [];
+    }
 
     // Add space after word
     const space = document.createTextNode(' ');
@@ -1548,7 +1848,6 @@ document.addEventListener('keydown', function (e) {
         updateWordDisplay(currentWordIndex);
 
         // Check if character is correct
-        const currentWord = words[currentWordIndex];
         const charIndex = currentTypedText.length - 1;
         const isCorrect = charIndex < currentWord.length &&
             currentTypedText[charIndex] === currentWord[charIndex];
@@ -1792,6 +2091,11 @@ function goToMenu() {
     if (audioEngine && audioEngine.isInitialized) {
         audioEngine.stopAll();
     }
+    // Invalida cualquier descarga de palabras en vuelo: si el jugador salió al
+    // menú mientras cargaba, esa partida ya no debe montarse a su espalda.
+    initGeneration++;
+    isLoadingWords = false;
+
     // Restore hidden UI so the next game session starts in a clean state
     restoreGameUI();
     resultsDiv.classList.remove('active');
