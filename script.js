@@ -118,9 +118,11 @@ const WORDLIST_FILES = {
     en: { common: 'english_1k', extended: 'english_10k' }
 };
 
-// Perfil de cada dificultad: qué corpus usar, rango de longitud y nº de oraciones
+// Perfil de cada dificultad: qué corpus usar, rango de longitud y nº de oraciones.
+// El mínimo de 'easy' es 4 y no 2 a propósito: las palabras de 2-3 letras que
+// devuelve la API son casi todas abreviaturas y siglas ("com", "cia", "ceo").
 const DIFFICULTY_PROFILES = {
-    easy: { corpus: 'common', minLength: 2, maxLength: 5, sentenceCount: 3 },
+    easy: { corpus: 'common', minLength: 4, maxLength: 5, sentenceCount: 3 },
     medium: { corpus: 'common', minLength: 4, maxLength: 8, sentenceCount: 5 },
     hard: { corpus: 'extended', minLength: 7, maxLength: 14, sentenceCount: 6 }
 };
@@ -130,9 +132,9 @@ const WORDS_PER_SENTENCE = 5;
 // Corta la petición si el servicio no responde, para no dejar el menú colgado
 const WORDLIST_TIMEOUT_MS = 8000;
 
-// Añade un punto final a cada oración. Es lo que activa el bonus de oración
-// completada (SENTENCE_BONUS); ponlo en false si no quieres teclear el punto.
-const ADD_SENTENCE_PERIODS = true;
+// El jugador NUNCA teclea puntuación: las palabras van limpias. El final de
+// oración se lleva por índice (ver sentenceEndIndices) y el punto que se ve en
+// el texto acumulado es solo decorativo.
 
 // Solo minúsculas simples: sin tildes, para no exigir teclado configurado.
 // La ñ sí se acepta en español porque es una tecla propia del layout.
@@ -251,7 +253,45 @@ async function fetchWordsFromApi(language, profile) {
         );
     }
 
-    return words;
+    return validateAgainstCorpus(words, language);
+}
+
+/**
+ * Filtra las palabras de la API dejando solo las que existen en el corpus
+ * curado del idioma.
+ *
+ * Hace falta porque el vocabulario de Datamuse incluye extranjerismos y
+ * abreviaturas: consultando en español aparecen "car", "com", "cia", "ceo" o
+ * "cit" entre las más frecuentes, además de nombres propios en minúscula
+ * ("holland", "guadalupe"). Cruzarlas contra el corpus del idioma los descarta
+ * sin necesidad de adivinar nada.
+ *
+ * Si el corpus no se puede descargar se devuelven las palabras sin validar:
+ * es preferible algo de ruido a quedarse sin partida.
+ *
+ * @param {string[]} words - Palabras devueltas por la API
+ * @param {string} language - 'es' o 'en'
+ * @returns {Promise<string[]>}
+ */
+async function validateAgainstCorpus(words, language) {
+    try {
+        const corpus = new Set(await fetchWordList(language, 'extended'));
+        const validated = words.filter(word => corpus.has(word));
+
+        if (validated.length < WORDS_PER_SENTENCE) {
+            console.warn(
+                `Validación cruzada descartó demasiadas palabras ` +
+                `(${validated.length} de ${words.length}); se usan sin validar`
+            );
+            return words;
+        }
+
+        return validated;
+
+    } catch (error) {
+        console.warn(`No se pudo validar contra el corpus: ${error.message}`);
+        return words;
+    }
 }
 
 /**
@@ -332,11 +372,7 @@ function buildSentences(words) {
     const sentences = [];
 
     for (let i = 0; i + WORDS_PER_SENTENCE <= words.length; i += WORDS_PER_SENTENCE) {
-        const chunk = words.slice(i, i + WORDS_PER_SENTENCE);
-        if (ADD_SENTENCE_PERIODS) {
-            chunk[chunk.length - 1] += '.';
-        }
-        sentences.push(chunk.join(' '));
+        sentences.push(words.slice(i, i + WORDS_PER_SENTENCE).join(' '));
     }
 
     return sentences;
@@ -1185,6 +1221,10 @@ let accumulatedWords = []; // Words that have been typed correctly
 // el área acumulada y parpadeaban también las oraciones ya terminadas.
 let currentSentenceSpans = [];
 
+// Índices de `words` que cierran una oración. Sustituye al truco de mirar si
+// la palabra terminaba en punto, que obligaba a teclear el punto.
+let sentenceEndIndices = new Set();
+
 // Combo manager instance
 let comboManager = null;
 
@@ -1246,6 +1286,7 @@ function cleanGameState() {
     completedSentences = 0;
     accumulatedWords = [];
     currentSentenceSpans = [];
+    sentenceEndIndices = new Set();
 
     // Reset combo manager
     if (comboManager) {
@@ -1349,9 +1390,16 @@ async function initGame() {
     // Descartar el resultado si mientras tanto se pidió otra partida
     if (myGeneration !== initGeneration) return;
 
-    // Generate sentences from bank
-    const fullText = sentenceBank.join(' ');
-    words = fullText.split(' ').filter(w => w.length > 0);
+    // Aplanar las oraciones en una sola lista de palabras, anotando qué índice
+    // cierra cada oración. Así el jugador teclea solo letras, sin puntuación.
+    words = [];
+    sentenceEndIndices = new Set();
+    sentenceBank.forEach(sentence => {
+        const sentenceWords = sentence.split(' ').filter(w => w.length > 0);
+        if (sentenceWords.length === 0) return;
+        words.push(...sentenceWords);
+        sentenceEndIndices.add(words.length - 1);
+    });
 
     // Initialize word states with staggered Y positions
     wordStates = words.map((word, index) => ({
@@ -1582,19 +1630,23 @@ function animate() {
     animationFrameId = requestAnimationFrame(animate);
 }
 
+/** ¿El índice `index` cierra una oración? */
+function isSentenceEnd(index) {
+    return sentenceEndIndices.has(index);
+}
+
 // --- ADD WORD TO ACCUMULATED AREA ---
-function addWordToAccumulated(word) {
+function addWordToAccumulated(word, index) {
     const wordSpan = document.createElement('span');
     wordSpan.className = 'word-accumulated';
     wordSpan.textContent = word;
     currentSentenceSpans.push(wordSpan);
+    accumulatedSentences.appendChild(wordSpan);
 
-    // Check if word ends with period (sentence end)
-    if (word.endsWith('.')) {
-        // Remove period from word and add separately
-        wordSpan.textContent = word.slice(0, -1);
-        accumulatedSentences.appendChild(wordSpan);
-
+    // El fin de oración lo marca el índice, no la puntuación de la palabra
+    if (isSentenceEnd(index)) {
+        // El punto es decorativo: se añade al texto acumulado, pero nunca
+        // formó parte de lo que el jugador tuvo que teclear.
         const periodSpan = document.createElement('span');
         periodSpan.className = 'period';
         periodSpan.textContent = '.';
@@ -1649,8 +1701,6 @@ function addWordToAccumulated(word) {
                 sentenceSpans.forEach(w => w.classList.remove('sentence-complete'));
             }, 600);
         }, 100);
-    } else {
-        accumulatedSentences.appendChild(wordSpan);
     }
 
     // Add space after word
@@ -1659,7 +1709,7 @@ function addWordToAccumulated(word) {
 }
 
 // --- MARK WORD AS MISSED ---
-function addMissedWordToAccumulated(word) {
+function addMissedWordToAccumulated(word, index) {
     const wordSpan = document.createElement('span');
     wordSpan.className = 'word-accumulated';
     wordSpan.textContent = word;
@@ -1669,7 +1719,11 @@ function addMissedWordToAccumulated(word) {
     // Si la palabra fallada era la que cerraba la oración, la oración termina
     // igualmente (sin bonus ni animación). Hay que soltar los spans acumulados
     // o se arrastrarían a la oración siguiente y se animarían con ella.
-    if (word.endsWith('.')) {
+    if (isSentenceEnd(index)) {
+        const periodSpan = document.createElement('span');
+        periodSpan.className = 'period';
+        periodSpan.textContent = '.';
+        accumulatedSentences.appendChild(periodSpan);
         currentSentenceSpans = [];
     }
 
@@ -1710,7 +1764,7 @@ function markWordAsMissed(index) {
     }
 
     // Add missed word to accumulated area in red
-    addMissedWordToAccumulated(words[index]);
+    addMissedWordToAccumulated(words[index], index);
 
     // Clear keyboard highlights
     if (keyboardVisualizer) {
@@ -1759,7 +1813,7 @@ function markWordAsCompleted(index) {
     }
 
     // Add word to accumulated area
-    addWordToAccumulated(words[index]);
+    addWordToAccumulated(words[index], index);
 
     // Visual success effect
     if (state.element) {
