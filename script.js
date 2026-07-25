@@ -1645,12 +1645,9 @@ function addWordToAccumulated(word, index) {
 
     // El fin de oración lo marca el índice, no la puntuación de la palabra
     if (isSentenceEnd(index)) {
-        // El punto es decorativo: se añade al texto acumulado, pero nunca
-        // formó parte de lo que el jugador tuvo que teclear.
-        const periodSpan = document.createElement('span');
-        periodSpan.className = 'period';
-        periodSpan.textContent = '.';
-        accumulatedSentences.appendChild(periodSpan);
+        // Sin punto: la separación entre oraciones es solo un margen extra
+        // en la última palabra (ver .sentence-end en styles.css).
+        wordSpan.classList.add('sentence-end');
 
         // Mark sentence as complete and award bonus
         completedSentences++;
@@ -1720,10 +1717,7 @@ function addMissedWordToAccumulated(word, index) {
     // igualmente (sin bonus ni animación). Hay que soltar los spans acumulados
     // o se arrastrarían a la oración siguiente y se animarían con ella.
     if (isSentenceEnd(index)) {
-        const periodSpan = document.createElement('span');
-        periodSpan.className = 'period';
-        periodSpan.textContent = '.';
-        accumulatedSentences.appendChild(periodSpan);
+        wordSpan.classList.add('sentence-end');
         currentSentenceSpans = [];
     }
 

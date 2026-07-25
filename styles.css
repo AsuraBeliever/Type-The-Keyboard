@@ -120,9 +120,9 @@ body {
     animation: sentenceGlow 0.6s ease;
 }
 
-.accumulated-sentences .period {
-    color: #89b4fa;
-    font-weight: 700;
+/* Separa oraciones sin usar puntuación: el jugador nunca teclea puntos, así
+   que tampoco se muestra ninguno. Solo un hueco extra tras la última palabra. */
+.accumulated-sentences .sentence-end {
     margin-right: 0.8em;
 }
 
