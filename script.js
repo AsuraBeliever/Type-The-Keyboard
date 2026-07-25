@@ -1035,6 +1035,9 @@ async function initGame() {
                 console.log('Keyboard layout rendered:', layout.name);
             }).catch(error => {
                 console.error('Failed to detect keyboard layout:', error);
+                // Fallback: render default Spanish layout if detection fails
+                keyboardVisualizer.render(KeyboardVisualizer.LAYOUTS.QWERTY_ES);
+                console.log('Keyboard rendered with fallback layout: QWERTY Spanish');
             });
         }
     }
